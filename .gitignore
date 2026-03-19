@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+install/
+log/
+.cache/
+
+# Compiled binaries
+*.o
+*.so
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+.clangd
+
+# ROS 2 generated
+colcon.meta
+
+# Models (too large for git, users should export their own)
+models/*.engine
+models/*.onnx
+models/*.pt
+
+# Test outputs
+*.pcd
+*.jpg
+*.png
+!config/*.png
+
+# RTAB-Map databases
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gemini agent
+.gemini/
+.agents/

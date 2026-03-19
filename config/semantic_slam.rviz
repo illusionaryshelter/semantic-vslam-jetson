@@ -1,0 +1,36 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: Semantic Map Cloud
+      Topic:
+        Value: /semantic_vslam/semantic_map_cloud
+
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: RTAB-Map Cloud Map
+      Topic:
+        Value: /rtabmap/cloud_map
+
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Semantic Grid Map
+      Topic:
+        Value: /semantic_vslam/grid_map
+
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: RTAB-Map Grid Map
+      Topic:
+        Value: /rtabmap/map
+
+  Global Options:
+    Fixed Frame: map
