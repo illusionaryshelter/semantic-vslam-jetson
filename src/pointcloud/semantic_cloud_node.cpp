@@ -180,6 +180,22 @@ void SemanticCloudNode::syncCallback(
   cv::Mat label_map;
   generateSemanticCloud(bgr_for_cloud, depth, objects, cloud, label_map);
 
+  // 3.5 从语义点云中剔除动态物体 → semantic_map_node 不会累积人/车鬼影
+  //     使用 label_map 定位动态像素, 将对应点云坐标设为 NaN
+  if (!label_map.empty()) {
+    const int cols = label_map.cols;
+    for (int v = 0; v < label_map.rows; ++v) {
+      const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
+      pcl::PointXYZRGB *cloud_row = &cloud.points[v * cols];
+      for (int u = 0; u < cols; ++u) {
+        if (lbl_row[u] > 0 && kDynamicClasses.count(lbl_row[u] - 1)) {
+          cloud_row[u].x = cloud_row[u].y = cloud_row[u].z =
+              std::numeric_limits<float>::quiet_NaN();
+        }
+      }
+    }
+  }
+
   auto t3 = std::chrono::steady_clock::now();
 
   // 4. 转换为 ROS2 PointCloud2 消息并发布
