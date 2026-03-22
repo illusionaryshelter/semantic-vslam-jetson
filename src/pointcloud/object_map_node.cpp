@@ -180,33 +180,80 @@ void ObjectMapNode::extractObjects() {
   const int rows = label_map.rows;
   const int cols = label_map.cols;
 
-  // 按 class_id 分组收集 3D 点 (只处理静态物体类别)
-  std::unordered_map<int, std::vector<Eigen::Vector3f>> class_points;
+  // ---- 实例分离: 用连通域分析将同类不同物体分开 ----
+  // 步骤:
+  //   1. 收集出现的静态类别
+  //   2. 对每个类别提取二值掩码 → connectedComponents 获取实例
+  //   3. 按 (class_id, instance_id) 收集 3D 点
 
+  // 收集出现的静态类别
+  std::set<int> present_classes;
   for (int v = 0; v < rows; ++v) {
     const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
-    const pcl::PointXYZRGB *cloud_row = &cloud.points[v * cols];
     for (int u = 0; u < cols; ++u) {
       uint8_t lbl = lbl_row[u];
-      if (lbl == 0) continue;  // 无标签
+      if (lbl == 0) continue;
       int cls = lbl - 1;
-      if (!kStaticObjectClasses.count(cls)) continue;  // 非静态物体
-
-      const auto &pt = cloud_row[u];
-      if (std::isnan(pt.z) || pt.z <= 0.01f) continue;
-
-      // 变换到 map 坐标系
-      Eigen::Vector4f p(pt.x, pt.y, pt.z, 1.0f);
-      Eigen::Vector4f p_map = tf_mat * p;
-      class_points[cls].emplace_back(p_map[0], p_map[1], p_map[2]);
+      if (kStaticObjectClasses.count(cls)) present_classes.insert(cls);
     }
   }
 
-  // 对每个类别拟合 AABB
+  // 用 pair<class_id, instance_id> 作为 key 收集 3D 点
+  struct InstanceKey {
+    int class_id;
+    int instance_id;
+    bool operator==(const InstanceKey &o) const {
+      return class_id == o.class_id && instance_id == o.instance_id;
+    }
+  };
+  struct InstanceKeyHash {
+    size_t operator()(const InstanceKey &k) const {
+      return std::hash<int>()(k.class_id) ^
+             (std::hash<int>()(k.instance_id) << 16);
+    }
+  };
+  std::unordered_map<InstanceKey, std::vector<Eigen::Vector3f>,
+                     InstanceKeyHash> instance_points;
+
+  for (int cls : present_classes) {
+    // 提取该类别的二值掩码
+    cv::Mat mask = cv::Mat::zeros(rows, cols, CV_8UC1);
+    for (int v = 0; v < rows; ++v) {
+      const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
+      uint8_t *mask_row = mask.ptr<uint8_t>(v);
+      for (int u = 0; u < cols; ++u) {
+        if (lbl_row[u] == cls + 1) mask_row[u] = 255;
+      }
+    }
+
+    // 连通域分析 → 分离不同实例
+    cv::Mat labels_cc;
+    int num_instances = cv::connectedComponents(mask, labels_cc, 8);
+
+    // 按实例收集 3D 点 (label 0 = 背景, 跳过)
+    for (int v = 0; v < rows; ++v) {
+      const int *cc_row = labels_cc.ptr<int>(v);
+      const pcl::PointXYZRGB *cloud_row = &cloud.points[v * cols];
+      for (int u = 0; u < cols; ++u) {
+        int inst = cc_row[u];
+        if (inst == 0) continue;
+
+        const auto &pt = cloud_row[u];
+        if (std::isnan(pt.z) || pt.z <= 0.01f) continue;
+
+        Eigen::Vector4f p(pt.x, pt.y, pt.z, 1.0f);
+        Eigen::Vector4f p_map = tf_mat * p;
+        instance_points[{cls, inst}].emplace_back(
+            p_map[0], p_map[1], p_map[2]);
+      }
+    }
+  }
+
+  // 对每个实例拟合 AABB → 合并到物体地图
   rclcpp::Time now_time = this->now();
   std::lock_guard<std::mutex> lock(map_mutex_);
 
-  for (auto &[cls, pts] : class_points) {
+  for (auto &[key, pts] : instance_points) {
     if (static_cast<int>(pts.size()) < min_points_) continue;
 
     // 计算 AABB
@@ -220,13 +267,13 @@ void ObjectMapNode::extractObjects() {
     Eigen::Vector3f center = (min_pt + max_pt) * 0.5f;
     Eigen::Vector3f size = max_pt - min_pt;
 
-    // 尺寸合理性检查: 忽略太小 (<5cm) 或太大 (>5m) 的
-    if (size.maxCoeff() < 0.05f || size.maxCoeff() > 5.0f) continue;
+    // 尺寸合理性检查: 忽略太小 (<5cm) 或太大 (>3m) 的
+    if (size.maxCoeff() < 0.05f || size.maxCoeff() > 3.0f) continue;
 
     // 数据关联: 在已有物体列表中查找同类 + 距离近的
     bool merged = false;
     for (auto &obj : object_map_) {
-      if (obj.class_id != cls) continue;
+      if (obj.class_id != key.class_id) continue;
       float dist = (obj.center - center).norm();
       if (dist < merge_distance_) {
         // 加权合并: 已有观测权重更大, 逐渐稳定
@@ -241,7 +288,7 @@ void ObjectMapNode::extractObjects() {
     }
 
     if (!merged && static_cast<int>(object_map_.size()) < max_objects_) {
-      object_map_.push_back({cls, center, size, 1, now_time});
+      object_map_.push_back({key.class_id, center, size, 1, now_time});
     }
   }
 
