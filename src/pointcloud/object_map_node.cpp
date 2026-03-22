@@ -19,9 +19,11 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
 
-#include <pcl/common/common.h>   // getMinMax3D
+#include <pcl/common/common.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
 
 #include <set>
 #include <unordered_map>
@@ -180,77 +182,91 @@ void ObjectMapNode::extractObjects() {
   const int rows = label_map.rows;
   const int cols = label_map.cols;
 
-  // ---- 实例分离: 用连通域分析将同类不同物体分开 ----
+  // ---- 3D 欧氏聚类实例分离 ----
+  // 比 2D connectedComponents 更准确:
+  //   两个物体在图像上相邻但 3D 空间分开 → 正确分离
+  //
   // 步骤:
-  //   1. 收集出现的静态类别
-  //   2. 对每个类别提取二值掩码 → connectedComponents 获取实例
-  //   3. 按 (class_id, instance_id) 收集 3D 点
+  //   1. 按类别收集所有 3D 点 (map 坐标系)
+  //   2. 对每个类别做 PCL EuclideanClusterExtraction
+  //   3. 每个聚类 = 一个物体实例
 
-  // 收集出现的静态类别
-  std::set<int> present_classes;
+  // 按类别收集 3D 点 (已变换到 map 坐标系)
+  struct TaggedPoint {
+    Eigen::Vector3f pos;
+    int class_id;
+  };
+  std::unordered_map<int, pcl::PointCloud<pcl::PointXYZ>::Ptr> class_clouds;
+
   for (int v = 0; v < rows; ++v) {
     const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
+    const pcl::PointXYZRGB *cloud_row = &cloud.points[v * cols];
     for (int u = 0; u < cols; ++u) {
       uint8_t lbl = lbl_row[u];
       if (lbl == 0) continue;
       int cls = lbl - 1;
-      if (kStaticObjectClasses.count(cls)) present_classes.insert(cls);
+      if (!kStaticObjectClasses.count(cls)) continue;
+
+      const auto &pt = cloud_row[u];
+      if (std::isnan(pt.z) || pt.z <= 0.01f) continue;
+
+      Eigen::Vector4f p(pt.x, pt.y, pt.z, 1.0f);
+      Eigen::Vector4f p_map = tf_mat * p;
+
+      if (!class_clouds.count(cls)) {
+        class_clouds[cls] = pcl::PointCloud<pcl::PointXYZ>::Ptr(
+            new pcl::PointCloud<pcl::PointXYZ>);
+      }
+      pcl::PointXYZ pp;
+      pp.x = p_map[0]; pp.y = p_map[1]; pp.z = p_map[2];
+      class_clouds[cls]->push_back(pp);
     }
   }
 
-  // 用 pair<class_id, instance_id> 作为 key 收集 3D 点
-  struct InstanceKey {
+  // 对每个类别做 3D 欧氏聚类 → 拟合 AABB
+  struct DetectedObject {
     int class_id;
-    int instance_id;
-    bool operator==(const InstanceKey &o) const {
-      return class_id == o.class_id && instance_id == o.instance_id;
-    }
+    Eigen::Vector3f center;
+    Eigen::Vector3f size;
   };
-  struct InstanceKeyHash {
-    size_t operator()(const InstanceKey &k) const {
-      return std::hash<int>()(k.class_id) ^
-             (std::hash<int>()(k.instance_id) << 16);
-    }
-  };
-  std::unordered_map<InstanceKey, std::vector<Eigen::Vector3f>,
-                     InstanceKeyHash> instance_points;
+  std::vector<DetectedObject> detections;
 
-  for (int cls : present_classes) {
-    // 提取该类别的二值掩码
-    cv::Mat mask = cv::Mat::zeros(rows, cols, CV_8UC1);
-    for (int v = 0; v < rows; ++v) {
-      const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
-      uint8_t *mask_row = mask.ptr<uint8_t>(v);
-      for (int u = 0; u < cols; ++u) {
-        if (lbl_row[u] == cls + 1) mask_row[u] = 255;
+  for (auto &[cls, cls_cloud] : class_clouds) {
+    if (static_cast<int>(cls_cloud->size()) < min_points_) continue;
+
+    // KdTree + 欧氏聚类
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(
+        new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(cls_cloud);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(0.15);   // 15cm: 同一物体内点间距
+    ec.setMinClusterSize(min_points_);
+    ec.setMaxClusterSize(50000);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(cls_cloud);
+    ec.extract(cluster_indices);
+
+    for (const auto &indices : cluster_indices) {
+      Eigen::Vector3f min_pt(1e9f, 1e9f, 1e9f);
+      Eigen::Vector3f max_pt(-1e9f, -1e9f, -1e9f);
+      for (int idx : indices.indices) {
+        const auto &p = cls_cloud->points[idx];
+        Eigen::Vector3f ep(p.x, p.y, p.z);
+        min_pt = min_pt.cwiseMin(ep);
+        max_pt = max_pt.cwiseMax(ep);
       }
-    }
+      Eigen::Vector3f center = (min_pt + max_pt) * 0.5f;
+      Eigen::Vector3f size = max_pt - min_pt;
 
-    // 连通域分析 → 分离不同实例
-    cv::Mat labels_cc;
-    int num_instances = cv::connectedComponents(mask, labels_cc, 8);
-
-    // 按实例收集 3D 点 (label 0 = 背景, 跳过)
-    for (int v = 0; v < rows; ++v) {
-      const int *cc_row = labels_cc.ptr<int>(v);
-      const pcl::PointXYZRGB *cloud_row = &cloud.points[v * cols];
-      for (int u = 0; u < cols; ++u) {
-        int inst = cc_row[u];
-        if (inst == 0) continue;
-
-        const auto &pt = cloud_row[u];
-        if (std::isnan(pt.z) || pt.z <= 0.01f) continue;
-
-        Eigen::Vector4f p(pt.x, pt.y, pt.z, 1.0f);
-        Eigen::Vector4f p_map = tf_mat * p;
-        instance_points[{cls, inst}].emplace_back(
-            p_map[0], p_map[1], p_map[2]);
-      }
+      // 尺寸合理性检查
+      if (size.maxCoeff() < 0.05f || size.maxCoeff() > 3.0f) continue;
+      detections.push_back({cls, center, size});
     }
   }
 
   // ---- 3D AABB IoU 数据关联 ----
-  // 辅助: 计算两个 AABB 的 IoU (Intersection over Union)
   auto computeIoU = [](const Eigen::Vector3f &c1, const Eigen::Vector3f &s1,
                        const Eigen::Vector3f &c2, const Eigen::Vector3f &s2) -> float {
     Eigen::Vector3f min1 = c1 - s1 * 0.5f, max1 = c1 + s1 * 0.5f;
@@ -265,7 +281,6 @@ void ObjectMapNode::extractObjects() {
     return (union_vol > 1e-6f) ? (inter_vol / union_vol) : 0.0f;
   };
 
-  // 辅助: 检查 b1 是否被 b2 包含 (b1 的大部分体积在 b2 内)
   auto isContainedIn = [](const Eigen::Vector3f &c1, const Eigen::Vector3f &s1,
                           const Eigen::Vector3f &c2, const Eigen::Vector3f &s2) -> bool {
     Eigen::Vector3f min1 = c1 - s1 * 0.5f, max1 = c1 + s1 * 0.5f;
@@ -281,32 +296,16 @@ void ObjectMapNode::extractObjects() {
   rclcpp::Time now_time = this->now();
   std::lock_guard<std::mutex> lock(map_mutex_);
 
-  for (auto &[key, pts] : instance_points) {
-    if (static_cast<int>(pts.size()) < min_points_) continue;
-
-    // 计算 AABB
-    Eigen::Vector3f min_pt(1e9f, 1e9f, 1e9f);
-    Eigen::Vector3f max_pt(-1e9f, -1e9f, -1e9f);
-    for (const auto &p : pts) {
-      min_pt = min_pt.cwiseMin(p);
-      max_pt = max_pt.cwiseMax(p);
-    }
-
-    Eigen::Vector3f center = (min_pt + max_pt) * 0.5f;
-    Eigen::Vector3f size = max_pt - min_pt;
-
-    // 尺寸合理性检查
-    if (size.maxCoeff() < 0.05f || size.maxCoeff() > 3.0f) continue;
-
+  for (auto &det : detections) {
     // 数据关联: IoU > 0.15 或被包含 → 合并
     int best_idx = -1;
     float best_iou = 0.0f;
     for (int i = 0; i < static_cast<int>(object_map_.size()); ++i) {
       auto &obj = object_map_[i];
-      if (obj.class_id != key.class_id) continue;
-      float iou = computeIoU(obj.center, obj.size, center, size);
-      bool contained = isContainedIn(center, size, obj.center, obj.size) ||
-                       isContainedIn(obj.center, obj.size, center, size);
+      if (obj.class_id != det.class_id) continue;
+      float iou = computeIoU(obj.center, obj.size, det.center, det.size);
+      bool contained = isContainedIn(det.center, det.size, obj.center, obj.size) ||
+                       isContainedIn(obj.center, obj.size, det.center, det.size);
       float score = contained ? std::max(iou, 0.2f) : iou;
       if (score > best_iou) {
         best_iou = score;
@@ -315,15 +314,14 @@ void ObjectMapNode::extractObjects() {
     }
 
     if (best_idx >= 0 && best_iou > 0.15f) {
-      // 加权合并
       auto &obj = object_map_[best_idx];
       float w = 1.0f / (obj.observe_count + 1);
-      obj.center = obj.center * (1.0f - w) + center * w;
-      obj.size = obj.size * (1.0f - w) + size * w;
+      obj.center = obj.center * (1.0f - w) + det.center * w;
+      obj.size = obj.size * (1.0f - w) + det.size * w;
       obj.observe_count++;
       obj.last_seen = now_time;
     } else if (static_cast<int>(object_map_.size()) < max_objects_) {
-      object_map_.push_back({key.class_id, center, size, 1, now_time});
+      object_map_.push_back({det.class_id, det.center, det.size, 1, now_time});
     }
   }
 
@@ -338,7 +336,6 @@ void ObjectMapNode::extractObjects() {
                        isContainedIn(object_map_[i].center, object_map_[i].size,
                                      object_map_[j].center, object_map_[j].size);
       if (iou > 0.1f || contained) {
-        // 保留观测次数多的, 合并另一个
         auto &keep = (object_map_[i].observe_count >= object_map_[j].observe_count)
                          ? object_map_[i] : object_map_[j];
         auto &drop = (object_map_[i].observe_count >= object_map_[j].observe_count)
@@ -346,7 +343,7 @@ void ObjectMapNode::extractObjects() {
         float w = static_cast<float>(drop.observe_count) /
                   (keep.observe_count + drop.observe_count);
         keep.center = keep.center * (1.0f - w) + drop.center * w;
-        keep.size = keep.size.cwiseMax(drop.size);  // 取更大尺寸
+        keep.size = keep.size.cwiseMax(drop.size);
         keep.observe_count += drop.observe_count;
         if (drop.last_seen > keep.last_seen) keep.last_seen = drop.last_seen;
         object_map_.erase(object_map_.begin() + j);
@@ -356,11 +353,19 @@ void ObjectMapNode::extractObjects() {
     }
   }
 
-  // 清理长时间未观测的物体 (>30秒)
+  // ---- 观测计数衰减 + 清理 ----
+  // 超过 5 秒未观测 → observe_count 每周期 -1 (渐进淘汰)
+  for (auto &obj : object_map_) {
+    if ((now_time - obj.last_seen).seconds() > 5.0 && obj.observe_count > 0) {
+      obj.observe_count--;
+    }
+  }
+  // 超过 15 秒未观测 或 observe_count 降为 0 → 移除
   object_map_.erase(
       std::remove_if(object_map_.begin(), object_map_.end(),
           [&](const ObjectInstance &obj) {
-            return (now_time - obj.last_seen).seconds() > 30.0;
+            return (now_time - obj.last_seen).seconds() > 15.0 ||
+                   obj.observe_count <= 0;
           }),
       object_map_.end());
 }

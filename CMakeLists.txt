@@ -35,7 +35,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io filters)
+find_package(PCL REQUIRED COMPONENTS common io filters segmentation search)
 
 # --- TensorRT ---
 find_library(NVINFER_LIB nvinfer REQUIRED)
