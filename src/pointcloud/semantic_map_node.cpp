@@ -229,27 +229,35 @@ void SemanticMapNode::publishTimer() {
   std::unordered_map<VKey, VoxelAccum, VKeyHash> voxel_map;
   size_t total_pts = 0;
 
+  // ---- 快照窗口指针 (最小化锁持有时间) ----
+  // 仅拷贝 shared_ptr (150个 × 16字节 ≈ 2.4KB), 不拷贝点云数据
+  std::vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> frame_ptrs;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (cloud_window_.empty()) return;
-
-    // 预估体素数量用于 reserve (去重后约 1/3~1/2)
-    for (const auto &sc : cloud_window_) total_pts += sc.cloud->size();
-    voxel_map.reserve(total_pts / 3);
-
-    // 直接遍历窗口帧 → 哈希累积 (跳过 merge 拷贝)
+    frame_ptrs.reserve(cloud_window_.size());
     for (const auto &sc : cloud_window_) {
-      for (const auto &pt : sc.cloud->points) {
-        VKey key;
-        key.x = static_cast<int>(std::floor(pt.x * inv_vs));
-        key.y = static_cast<int>(std::floor(pt.y * inv_vs));
-        key.z = static_cast<int>(std::floor(pt.z * inv_vs));
+      frame_ptrs.push_back(sc.cloud);
+      total_pts += sc.cloud->size();
+    }
+  }
+  // 锁已释放 — cloudCallback 不再被阻塞
 
-        auto &v = voxel_map[key];
-        v.sx += pt.x;  v.sy += pt.y;  v.sz += pt.z;
-        v.sr += pt.r;  v.sg += pt.g;  v.sb += pt.b;
-        v.count++;
-      }
+  // 预估体素数量用于 reserve
+  voxel_map.reserve(total_pts / 3);
+
+  // 哈希质心累积 (无锁, 不阻塞 cloudCallback)
+  for (const auto &cloud_ptr : frame_ptrs) {
+    for (const auto &pt : cloud_ptr->points) {
+      VKey key;
+      key.x = static_cast<int>(std::floor(pt.x * inv_vs));
+      key.y = static_cast<int>(std::floor(pt.y * inv_vs));
+      key.z = static_cast<int>(std::floor(pt.z * inv_vs));
+
+      auto &v = voxel_map[key];
+      v.sx += pt.x;  v.sy += pt.y;  v.sz += pt.z;
+      v.sr += pt.r;  v.sg += pt.g;  v.sb += pt.b;
+      v.count++;
     }
   }
 
