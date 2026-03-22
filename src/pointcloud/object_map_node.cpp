@@ -249,7 +249,35 @@ void ObjectMapNode::extractObjects() {
     }
   }
 
-  // 对每个实例拟合 AABB → 合并到物体地图
+  // ---- 3D AABB IoU 数据关联 ----
+  // 辅助: 计算两个 AABB 的 IoU (Intersection over Union)
+  auto computeIoU = [](const Eigen::Vector3f &c1, const Eigen::Vector3f &s1,
+                       const Eigen::Vector3f &c2, const Eigen::Vector3f &s2) -> float {
+    Eigen::Vector3f min1 = c1 - s1 * 0.5f, max1 = c1 + s1 * 0.5f;
+    Eigen::Vector3f min2 = c2 - s2 * 0.5f, max2 = c2 + s2 * 0.5f;
+    Eigen::Vector3f inter_min = min1.cwiseMax(min2);
+    Eigen::Vector3f inter_max = max1.cwiseMin(max2);
+    Eigen::Vector3f inter_size = (inter_max - inter_min).cwiseMax(0.0f);
+    float inter_vol = inter_size.x() * inter_size.y() * inter_size.z();
+    float vol1 = s1.x() * s1.y() * s1.z();
+    float vol2 = s2.x() * s2.y() * s2.z();
+    float union_vol = vol1 + vol2 - inter_vol;
+    return (union_vol > 1e-6f) ? (inter_vol / union_vol) : 0.0f;
+  };
+
+  // 辅助: 检查 b1 是否被 b2 包含 (b1 的大部分体积在 b2 内)
+  auto isContainedIn = [](const Eigen::Vector3f &c1, const Eigen::Vector3f &s1,
+                          const Eigen::Vector3f &c2, const Eigen::Vector3f &s2) -> bool {
+    Eigen::Vector3f min1 = c1 - s1 * 0.5f, max1 = c1 + s1 * 0.5f;
+    Eigen::Vector3f min2 = c2 - s2 * 0.5f, max2 = c2 + s2 * 0.5f;
+    Eigen::Vector3f inter_min = min1.cwiseMax(min2);
+    Eigen::Vector3f inter_max = max1.cwiseMin(max2);
+    Eigen::Vector3f inter_size = (inter_max - inter_min).cwiseMax(0.0f);
+    float inter_vol = inter_size.x() * inter_size.y() * inter_size.z();
+    float vol1 = s1.x() * s1.y() * s1.z();
+    return (vol1 > 1e-6f) && (inter_vol / vol1 > 0.5f);
+  };
+
   rclcpp::Time now_time = this->now();
   std::lock_guard<std::mutex> lock(map_mutex_);
 
@@ -267,28 +295,64 @@ void ObjectMapNode::extractObjects() {
     Eigen::Vector3f center = (min_pt + max_pt) * 0.5f;
     Eigen::Vector3f size = max_pt - min_pt;
 
-    // 尺寸合理性检查: 忽略太小 (<5cm) 或太大 (>3m) 的
+    // 尺寸合理性检查
     if (size.maxCoeff() < 0.05f || size.maxCoeff() > 3.0f) continue;
 
-    // 数据关联: 在已有物体列表中查找同类 + 距离近的
-    bool merged = false;
-    for (auto &obj : object_map_) {
+    // 数据关联: IoU > 0.15 或被包含 → 合并
+    int best_idx = -1;
+    float best_iou = 0.0f;
+    for (int i = 0; i < static_cast<int>(object_map_.size()); ++i) {
+      auto &obj = object_map_[i];
       if (obj.class_id != key.class_id) continue;
-      float dist = (obj.center - center).norm();
-      if (dist < merge_distance_) {
-        // 加权合并: 已有观测权重更大, 逐渐稳定
-        float w = 1.0f / (obj.observe_count + 1);
-        obj.center = obj.center * (1.0f - w) + center * w;
-        obj.size = obj.size * (1.0f - w) + size * w;
-        obj.observe_count++;
-        obj.last_seen = now_time;
-        merged = true;
-        break;
+      float iou = computeIoU(obj.center, obj.size, center, size);
+      bool contained = isContainedIn(center, size, obj.center, obj.size) ||
+                       isContainedIn(obj.center, obj.size, center, size);
+      float score = contained ? std::max(iou, 0.2f) : iou;
+      if (score > best_iou) {
+        best_iou = score;
+        best_idx = i;
       }
     }
 
-    if (!merged && static_cast<int>(object_map_.size()) < max_objects_) {
+    if (best_idx >= 0 && best_iou > 0.15f) {
+      // 加权合并
+      auto &obj = object_map_[best_idx];
+      float w = 1.0f / (obj.observe_count + 1);
+      obj.center = obj.center * (1.0f - w) + center * w;
+      obj.size = obj.size * (1.0f - w) + size * w;
+      obj.observe_count++;
+      obj.last_seen = now_time;
+    } else if (static_cast<int>(object_map_.size()) < max_objects_) {
       object_map_.push_back({key.class_id, center, size, 1, now_time});
+    }
+  }
+
+  // ---- 合并冗余物体 (同类 + 重叠显著) ----
+  for (int i = 0; i < static_cast<int>(object_map_.size()); ++i) {
+    for (int j = i + 1; j < static_cast<int>(object_map_.size()); ) {
+      if (object_map_[i].class_id != object_map_[j].class_id) { ++j; continue; }
+      float iou = computeIoU(object_map_[i].center, object_map_[i].size,
+                             object_map_[j].center, object_map_[j].size);
+      bool contained = isContainedIn(object_map_[j].center, object_map_[j].size,
+                                     object_map_[i].center, object_map_[i].size) ||
+                       isContainedIn(object_map_[i].center, object_map_[i].size,
+                                     object_map_[j].center, object_map_[j].size);
+      if (iou > 0.1f || contained) {
+        // 保留观测次数多的, 合并另一个
+        auto &keep = (object_map_[i].observe_count >= object_map_[j].observe_count)
+                         ? object_map_[i] : object_map_[j];
+        auto &drop = (object_map_[i].observe_count >= object_map_[j].observe_count)
+                         ? object_map_[j] : object_map_[i];
+        float w = static_cast<float>(drop.observe_count) /
+                  (keep.observe_count + drop.observe_count);
+        keep.center = keep.center * (1.0f - w) + drop.center * w;
+        keep.size = keep.size.cwiseMax(drop.size);  // 取更大尺寸
+        keep.observe_count += drop.observe_count;
+        if (drop.last_seen > keep.last_seen) keep.last_seen = drop.last_seen;
+        object_map_.erase(object_map_.begin() + j);
+      } else {
+        ++j;
+      }
     }
   }
 
@@ -317,6 +381,9 @@ void ObjectMapNode::publishMarkers() {
 
   int id = 0;
   for (const auto &obj : object_map_) {
+    // 至少观测 2 次才显示 (过滤噪声)
+    if (obj.observe_count < 2) continue;
+
     // 半透明立方体
     visualization_msgs::msg::Marker cube;
     cube.header.stamp = stamp;
