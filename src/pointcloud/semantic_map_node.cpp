@@ -116,6 +116,17 @@ void SemanticMapNode::cloudCallback(
 
   if (transformed->empty()) return;
 
+  // ---- 增量式体素滤波: 对单帧立即滤波 (~1ms) ----
+  // 存入 sliding window 的是已滤波的小点云，而非原始大点云
+  if (voxel_size_ > 0.0) {
+    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
+    vg.setInputCloud(transformed);
+    vg.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
+    auto filtered = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
+    vg.filter(*filtered);
+    transformed = filtered;
+  }
+
   transformed->width = transformed->size();
   transformed->height = 1;
   transformed->is_dense = true;
@@ -153,7 +164,8 @@ void SemanticMapNode::publishTimer() {
 
   auto tp1 = std::chrono::steady_clock::now();
 
-  // 体素滤波
+  // 轻量去重: 帧间重叠区域会有重复体素, 用同尺寸再滤一次
+  // 由于各帧已预滤波, 输入点数大幅减少, 此步骤很快
   if (voxel_size_ > 0.0) {
     pcl::VoxelGrid<pcl::PointXYZRGB> vg;
     vg.setInputCloud(merged);
