@@ -145,24 +145,29 @@ void ObjectMapNode::processTimer() {
 
 // ---------------------------------------------------------------------------
 void ObjectMapNode::extractObjects() {
-  // 取出最新数据 (取出后清空, 避免重复处理)
+  // 读取最新数据 (不清空 — 保留供下次使用)
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg;
   sensor_msgs::msg::Image::SharedPtr label_msg;
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     cloud_msg = latest_cloud_;
     label_msg = latest_label_;
-    latest_cloud_.reset();
-    latest_label_.reset();
   }
 
   if (!cloud_msg || !label_msg) return;
 
+  // 跳过已处理过的帧 (用 cloud 时间戳判断)
+  rclcpp::Time cloud_stamp(cloud_msg->header.stamp);
+  if (cloud_stamp == last_processed_stamp_) return;
+
   // 时间戳差距过大则跳过 (不是同一帧)
   double dt = std::abs(
-      rclcpp::Time(cloud_msg->header.stamp).seconds() -
+      cloud_stamp.seconds() -
       rclcpp::Time(label_msg->header.stamp).seconds());
   if (dt > 0.1) return;
+
+  // 标记已处理
+  last_processed_stamp_ = cloud_stamp;
 
   // 查找 TF: cloud frame → map (缩短等待时间以加快响应)
   Eigen::Matrix4f tf_mat;

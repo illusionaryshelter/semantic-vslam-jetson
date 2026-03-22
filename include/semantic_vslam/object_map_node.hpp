@@ -84,6 +84,7 @@ private:
   float merge_distance_;         // 同类物体合并距离 (m)
   int max_objects_;              // 最大物体数量
   bool enable_profiling_ = false;
+  rclcpp::Time last_processed_stamp_{0, 0, RCL_ROS_TIME};  // 上次处理的帧时间戳
 };
 
 } // namespace semantic_vslam
