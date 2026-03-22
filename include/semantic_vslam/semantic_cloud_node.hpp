@@ -48,12 +48,6 @@ private:
   // 相机内参回调 (只取一次)
   void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
 
-  // 核心: 将 RGB + Depth + YOLO 掩码 → PointXYZRGB 点云 + 语义标签图
-  void generateSemanticCloud(const cv::Mat &rgb, const cv::Mat &depth,
-                             const std::vector<Object> &objects,
-                             pcl::PointCloud<pcl::PointXYZRGB> &cloud,
-                             cv::Mat &out_label_map);
-
   // YOLO
   std::unique_ptr<YoloInference> yolo_;
 
