@@ -184,11 +184,11 @@ void SemanticCloudNode::syncCallback(
 
   auto t3 = std::chrono::steady_clock::now();
 
-  // 4. 转换为 ROS2 PointCloud2 消息并发布
-  sensor_msgs::msg::PointCloud2 pc2_msg;
-  pcl::toROSMsg(cloud, pc2_msg);
-  pc2_msg.header = rgb_msg->header;
-  cloud_pub_->publish(pc2_msg);
+  // 4. 转换为 ROS2 PointCloud2 消息并发布 (unique_ptr → IPC 零拷贝)
+  auto pc2_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+  pcl::toROSMsg(cloud, *pc2_msg);
+  pc2_msg->header = rgb_msg->header;
+  cloud_pub_->publish(std::move(pc2_msg));
 
   // 5. 动态物体深度掩码: 将人/车/动物等动态类别区域的深度置零
   //    rtabmap 在深度=0 的区域不提特征 → 消除动态物体鬼影
@@ -250,9 +250,10 @@ void SemanticCloudNode::syncCallback(
     depth_pub_->publish(*depth_msg);
   }
 
-  // 6. 发布语义标签图
-  auto label_msg = cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg();
-  label_map_pub_->publish(*label_msg);
+  // 6. 发布语义标签图 (unique_ptr → IPC 零拷贝)
+  auto label_msg = std::make_unique<sensor_msgs::msg::Image>(
+      *cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg());
+  label_map_pub_->publish(std::move(label_msg));
 
   if (enable_profiling_) {
     auto t4 = std::chrono::steady_clock::now();
