@@ -182,7 +182,7 @@ def generate_launch_description():
             name='semantic_container',
             namespace='',
             package='rclcpp_components',
-            executable='component_container',  # 单线程: 2 节点无竞争
+            executable='component_container_mt',  # 多线程: VoxelGrid 已隔离, 无竞争风险
             output='screen',
         ),
 
