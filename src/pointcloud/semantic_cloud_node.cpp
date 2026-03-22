@@ -10,7 +10,6 @@
 
 #include "semantic_vslam/semantic_cloud_node.hpp"
 #include "semantic_vslam/cuda_colorspace.hpp"
-#include "semantic_vslam/cuda_depth_projection.hpp"
 
 #include <chrono>
 #include <set>
@@ -62,20 +61,6 @@ SemanticCloudNode::SemanticCloudNode(const rclcpp::NodeOptions &options)
     throw std::runtime_error("YOLO init failed");
   }
   RCLCPP_INFO(this->get_logger(), "YOLO model loaded: %s", engine_path.c_str());
-
-  // ---- 初始化 CUDA 深度投影常量表 ----
-  {
-    uint8_t colors[80][3];
-    bool dynamic[80] = {};
-    for (int i = 0; i < 80; ++i) {
-      colors[i][0] = kSemanticColors[i][0];
-      colors[i][1] = kSemanticColors[i][1];
-      colors[i][2] = kSemanticColors[i][2];
-      dynamic[i] = kDynamicClasses.count(i) > 0;
-    }
-    cuda::gpuDepthProjectionInit(colors, dynamic);
-    RCLCPP_INFO(this->get_logger(), "CUDA depth projection initialized");
-  }
 
   // ---- 订阅相机内参 (只需获取一次) ----
   cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -192,47 +177,10 @@ void SemanticCloudNode::syncCallback(
 
   auto t2 = std::chrono::steady_clock::now();
 
-  // 3. 生成语义标签图 (CPU — 依赖 YOLO mask, 数据量小)
-  cv::Mat label_map = cv::Mat::zeros(depth.rows, depth.cols, CV_8UC1);
-  cv::Mat conf_map = cv::Mat::zeros(depth.rows, depth.cols, CV_32FC1);
-  for (const auto &obj : objects) {
-    const cv::Rect &r = obj.rect;
-    int x0 = std::max(0, r.x);
-    int y0 = std::max(0, r.y);
-    int x1 = std::min(depth.cols, r.x + r.width);
-    int y1 = std::min(depth.rows, r.y + r.height);
-    if (x0 >= x1 || y0 >= y1 || obj.mask.empty()) continue;
-    for (int y = y0; y < y1; ++y) {
-      const uint8_t *mask_row = obj.mask.ptr<uint8_t>(y - r.y);
-      uint8_t *label_row = label_map.ptr<uint8_t>(y);
-      float *conf_row = conf_map.ptr<float>(y);
-      for (int x = x0; x < x1; ++x) {
-        int mx = x - r.x;
-        if (mx >= 0 && mx < obj.mask.cols && mask_row[mx] > 0) {
-          if (obj.prob > conf_row[x]) {
-            label_row[x] = static_cast<uint8_t>(obj.label + 1);
-            conf_row[x] = obj.prob;
-          }
-        }
-      }
-    }
-  }
-
-  // 4. GPU 深度投影 + 动态过滤 + 语义着色 (融合 kernel)
-  //    内核输出 PCL 兼容 32-byte 布局 → 单次 memcpy 填充点云
-  const int pixels = depth.rows * depth.cols;
+  // 3. 生成语义点云 + 标签图 (优化: 发布 PointXYZRGB, 节省带宽)
   pcl::PointCloud<pcl::PointXYZRGB> cloud;
-  cloud.width = depth.cols;
-  cloud.height = depth.rows;
-  cloud.is_dense = false;
-  cloud.points.resize(pixels);
-
-  cuda::gpuDepthProjectionRaw(
-      depth.data, (depth.type() == CV_16UC1),
-      label_map.data, bgr_for_cloud.data,
-      depth.cols, depth.rows,
-      fx_, fy_, cx_, cy_, depth_scale_,
-      cloud.points.data());  // 直接写入 PCL 内存
+  cv::Mat label_map;
+  generateSemanticCloud(bgr_for_cloud, depth, objects, cloud, label_map);
 
   auto t3 = std::chrono::steady_clock::now();
 
@@ -319,6 +267,111 @@ void SemanticCloudNode::syncCallback(
         ms_total > 0 ? 1000.0 / ms_total : 0.0, objects.size(),
         masked_pixels, valid_pixels);
   }
+}
+
+// ---------------------------------------------------------------------------
+// generateSemanticCloud
+//
+// 逐像素遍历 depth 图，对有效深度值的像素:
+//   1) 计算 3D 坐标 (x, y, z)
+//   2) 如果该像素被某个 YOLO 掩码覆盖 → 赋语义颜色 + label
+//      否则 → 保留原始 RGB + label=0
+// ---------------------------------------------------------------------------
+void SemanticCloudNode::generateSemanticCloud(
+    const cv::Mat &rgb, const cv::Mat &depth,
+    const std::vector<Object> &objects,
+    pcl::PointCloud<pcl::PointXYZRGB> &cloud,
+    cv::Mat &out_label_map) {
+
+  const int rows = depth.rows;
+  const int cols = depth.cols;
+
+  // 1. 语义标签图 + 置信度图
+  cv::Mat label_map = cv::Mat::zeros(rows, cols, CV_8UC1);
+  cv::Mat conf_map = cv::Mat::zeros(rows, cols, CV_32FC1);
+
+  for (const auto &obj : objects) {
+    const cv::Rect &r = obj.rect;
+    int x0 = std::max(0, r.x);
+    int y0 = std::max(0, r.y);
+    int x1 = std::min(cols, r.x + r.width);
+    int y1 = std::min(rows, r.y + r.height);
+    if (x0 >= x1 || y0 >= y1 || obj.mask.empty()) continue;
+
+    for (int y = y0; y < y1; ++y) {
+      const uint8_t *mask_row = obj.mask.ptr<uint8_t>(y - r.y);
+      uint8_t *label_row = label_map.ptr<uint8_t>(y);
+      float *conf_row = conf_map.ptr<float>(y);
+      for (int x = x0; x < x1; ++x) {
+        int mx = x - r.x;
+        if (mx >= 0 && mx < obj.mask.cols && mask_row[mx] > 0) {
+          if (obj.prob > conf_row[x]) {
+            label_row[x] = static_cast<uint8_t>(obj.label + 1);
+            conf_row[x] = obj.prob;
+          }
+        }
+      }
+    }
+  }
+
+  // 2. 逐像素生成点云 — 优化: row-pointer 直接访问，避免 .at<>()
+  cloud.clear();
+  cloud.width = cols;
+  cloud.height = rows;
+  cloud.is_dense = false;
+  cloud.points.resize(static_cast<size_t>(rows) * cols);
+
+  const float inv_fx = 1.0f / fx_;
+  const float inv_fy = 1.0f / fy_;
+  const bool is_16u = (depth.type() == CV_16UC1);
+
+  for (int v = 0; v < rows; ++v) {
+    // 获取当前行指针 — 比 .at<>() 快 5-10x (无边界检查)
+    const uint16_t *depth_row_16u = is_16u ? depth.ptr<uint16_t>(v) : nullptr;
+    const float *depth_row_f = !is_16u ? depth.ptr<float>(v) : nullptr;
+    const cv::Vec3b *rgb_row = rgb.ptr<cv::Vec3b>(v);
+    const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
+    pcl::PointXYZRGB *cloud_row = &cloud.points[v * cols];
+
+    for (int u = 0; u < cols; ++u) {
+      pcl::PointXYZRGB &pt = cloud_row[u];
+
+      float z = is_16u ? static_cast<float>(depth_row_16u[u]) * depth_scale_
+                       : depth_row_f[u];
+
+      if (z <= 0.01f || z > 10.0f || std::isnan(z)) {
+        pt.x = pt.y = pt.z = std::numeric_limits<float>::quiet_NaN();
+        pt.r = pt.g = pt.b = 0;
+        continue;
+      }
+
+      pt.x = (static_cast<float>(u) - cx_) * z * inv_fx;
+      pt.y = (static_cast<float>(v) - cy_) * z * inv_fy;
+      pt.z = z;
+
+      uint8_t lbl = lbl_row[u];
+      if (lbl > 0) {
+        int cls = lbl - 1;
+        // 动态物体 → NaN (不进入语义地图, 避免鬼影)
+        if (kDynamicClasses.count(cls)) {
+          pt.x = pt.y = pt.z = std::numeric_limits<float>::quiet_NaN();
+          pt.r = pt.g = pt.b = 0;
+          continue;
+        }
+        if (cls >= 0 && cls < 80) {
+          pt.r = kSemanticColors[cls][0];
+          pt.g = kSemanticColors[cls][1];
+          pt.b = kSemanticColors[cls][2];
+        } else {
+          pt.r = rgb_row[u][2]; pt.g = rgb_row[u][1]; pt.b = rgb_row[u][0];
+        }
+      } else {
+        pt.r = rgb_row[u][2]; pt.g = rgb_row[u][1]; pt.b = rgb_row[u][0];
+      }
+    }
+  }
+
+  out_label_map = label_map;
 }
 
 } // namespace semantic_vslam
