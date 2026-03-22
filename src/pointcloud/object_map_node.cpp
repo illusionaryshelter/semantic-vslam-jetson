@@ -70,7 +70,7 @@ ObjectMapNode::ObjectMapNode()
   this->declare_parameter<int>("min_points", 50);
   this->declare_parameter<double>("merge_distance", 0.5);
   this->declare_parameter<int>("max_objects", 50);
-  this->declare_parameter<double>("publish_rate", 1.0);
+  this->declare_parameter<double>("publish_rate", 2.0);  // 2 Hz 更快响应
   this->declare_parameter<bool>("enable_profiling", false);
 
   target_frame_ = this->get_parameter("target_frame").as_string();
@@ -145,15 +145,13 @@ void ObjectMapNode::processTimer() {
 
 // ---------------------------------------------------------------------------
 void ObjectMapNode::extractObjects() {
-  // 取出最新数据
+  // 取出最新数据 (不清空 — 允许下次 timer 重用同一帧)
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg;
   sensor_msgs::msg::Image::SharedPtr label_msg;
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     cloud_msg = latest_cloud_;
     label_msg = latest_label_;
-    latest_cloud_.reset();
-    latest_label_.reset();
   }
 
   if (!cloud_msg || !label_msg) return;
