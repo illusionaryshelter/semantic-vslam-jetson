@@ -172,62 +172,57 @@ def generate_launch_description():
 
 
         # ============================================================
-        # 4+5. 语义点云 + 语义地图 (同进程 IPC 零拷贝)
+        # 4. 语义点云 + 物体检测 (独立进程)
         #
-        # 两个节点加载到同一个 ComponentContainer 进程:
-        #   - semantic_cloud_node: YOLO → 语义点云
-        #   - semantic_map_node:   累积 + CUDA VoxelGrid
-        #
-        # use_intra_process_comms=True 启用零拷贝指针传递,
-        # 消除 semantic_cloud → semantic_map 的序列化开销 (~5ms/帧)
+        # YOLO TensorRT 推理 (GPU 重: 连续 30Hz)
+        # 独立进程避免与 VoxelGrid 争夺 GPU 时间片和 L2 cache
         # ============================================================
-        ComposableNodeContainer(
-            name='semantic_container',
-            namespace='',
-            package='rclcpp_components',
-            executable='component_container',
-            composable_node_descriptions=[
-                ComposableNode(
-                    package='semantic_vslam',
-                    plugin='semantic_vslam::SemanticCloudNode',
-                    name='semantic_cloud_node',
-                    parameters=[
-                        PathJoinSubstitution([
-                            FindPackageShare('semantic_vslam'),
-                            'config', 'params.yaml'
-                        ]),
-                        {
-                        'engine_path':    LaunchConfiguration('engine_path'),
-                        'rgb_topic':      LaunchConfiguration('rgb_topic'),
-                        'depth_topic':    LaunchConfiguration('depth_topic'),
-                        'cam_info_topic': LaunchConfiguration('cam_info_topic'),
-                        'conf_thresh':    LaunchConfiguration('conf_thresh'),
-                        'depth_scale':    0.001,
-                        'enable_profiling': True,
-                        },
-                    ],
-                    extra_arguments=[{'use_intra_process_comms': True}],
-                ),
-                ComposableNode(
-                    package='semantic_vslam',
-                    plugin='semantic_vslam::SemanticMapNode',
-                    name='semantic_map_node',
-                    parameters=[
-                        PathJoinSubstitution([
-                            FindPackageShare('semantic_vslam'),
-                            'config', 'params.yaml'
-                        ]),
-                        {
-                        'target_frame':     'map',
-                        'voxel_size':       0.02,
-                        'max_clouds':       150,
-                        'cloud_decimation': 3,
-                        'publish_rate':     1.0,
-                        'enable_profiling': True,
-                        },
-                    ],
-                    extra_arguments=[{'use_intra_process_comms': True}],
-                ),
+        Node(
+            package='semantic_vslam',
+            executable='semantic_cloud_node',
+            name='semantic_cloud_node',
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+                {
+                'engine_path':    LaunchConfiguration('engine_path'),
+                'rgb_topic':      LaunchConfiguration('rgb_topic'),
+                'depth_topic':    LaunchConfiguration('depth_topic'),
+                'cam_info_topic': LaunchConfiguration('cam_info_topic'),
+                'conf_thresh':    LaunchConfiguration('conf_thresh'),
+                'depth_scale':    0.001,
+                'enable_profiling': True,
+                },
+            ],
+            output='screen',
+        ),
+
+        # ============================================================
+        # 5. 语义地图累积 (独立进程)
+        #
+        # CUDA VoxelGrid (GPU 重: 突发 1Hz)
+        # 持久显存池 + UMA 零拷贝 (cudaMallocManaged)
+        # 独立进程: 与 YOLO 隔离 GPU/L2 争抢
+        # ============================================================
+        Node(
+            package='semantic_vslam',
+            executable='semantic_map_node',
+            name='semantic_map_node',
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+                {
+                'target_frame':     'map',
+                'voxel_size':       0.02,
+                'max_clouds':       150,
+                'cloud_decimation': 3,
+                'publish_rate':     1.0,
+                'enable_profiling': True,
+                },
             ],
             output='screen',
         ),
