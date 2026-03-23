@@ -1,0 +1,36 @@
+# clangd 配置 (Semantic VSLAM / Jetson Orin Nano)
+#
+# .cpp 文件: 正常 C++ 解析 (利用 compile_commands.json)
+# .cu 文件: 强制 C++ 模式 (clangd 14 CUDA 与 CUDA 12.6 不兼容)
+
+# ---- 全局: 适用于所有文件 ----
+CompileFlags:
+  Add:
+    - "-I/usr/local/cuda-12.6/include"
+    - "-std=c++17"
+  Remove:
+    # nvcc 特有参数
+    - "-forward-unknown-to-host-compiler"
+    - "--generate-code*"
+    - "-dc"
+    - "--expt-relaxed-constexpr"
+    - "--expt-extended-lambda"
+    - "-Xcompiler*"
+    - "-arch*"
+    - "-gencode*"
+
+---
+
+# ---- .cu 文件: 强制 C++ 模式 + 抑制所有诊断 ----
+If:
+  PathMatch: ".*\\.cu"
+CompileFlags:
+  Add:
+    - "-x"
+    - "c++"
+    - "-D__CUDACC__"
+    - "-D__CUDA_ARCH__=870"
+    - "-ferror-limit=0"
+    - "-w"
+Diagnostics:
+  Suppress: ["*"]
