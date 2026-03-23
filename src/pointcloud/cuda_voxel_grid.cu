@@ -50,7 +50,6 @@ struct GPUPool {
   uint32_t*   point_idx  = nullptr;  // 原始点索引 (随 key 一起排序)
   uint32_t*   boundary   = nullptr;  // Voxel 边界标记
   uint32_t*   prefix     = nullptr;  // Inclusive scan 前缀和
-  VoxelPoint* output     = nullptr;  // 输出缓冲区
   int capacity = 0;                  // 当前分配的最大点数
 
   // 确保容量足够, 仅在 N > capacity 时重新分配
@@ -65,7 +64,6 @@ struct GPUPool {
     cudaMallocManaged(&point_idx,  new_cap * sizeof(uint32_t));
     cudaMallocManaged(&boundary,   new_cap * sizeof(uint32_t));
     cudaMallocManaged(&prefix,     new_cap * sizeof(uint32_t));
-    cudaMallocManaged(&output,     new_cap * sizeof(VoxelPoint));
     capacity = new_cap;
   }
 
@@ -74,7 +72,6 @@ struct GPUPool {
     if (point_idx)  { cudaFree(point_idx);  point_idx  = nullptr; }
     if (boundary)   { cudaFree(boundary);   boundary   = nullptr; }
     if (prefix)     { cudaFree(prefix);     prefix     = nullptr; }
-    if (output)     { cudaFree(output);     output     = nullptr; }
     capacity = 0;
   }
 
@@ -196,17 +193,11 @@ int cudaVoxelGridFilterRaw(
     return 0;
   }
 
-  // ---- 提取每个 voxel 第一个点 ----
+  // ---- 提取每个 voxel 第一个点 (直接写到输出缓冲区, 无中间拷贝) ----
   gatherFirstPointKernel<<<GRID, BLOCK>>>(
       input, g_pool.point_idx, g_pool.boundary, g_pool.prefix,
-      N, g_pool.output);
+      N, h_output);
   cudaDeviceSynchronize();
-
-  // ---- 输出: managed memory, Jetson UMA 无需 D2H 拷贝 ----
-  // 如果 h_output 是 managed memory (由 wrapper 通过 getManagedBuffer 分配),
-  // 则直接 memcpy 在 UMA 上等同于内存内移动, 无 PCIe 传输
-  // 如果是普通 host memory (单元测试等), memcpy 正常工作
-  memcpy(h_output, g_pool.output, num_unique * sizeof(VoxelPoint));
 
   return static_cast<int>(num_unique);
 }
