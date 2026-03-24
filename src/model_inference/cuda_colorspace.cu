@@ -3,10 +3,9 @@
  *
  * GPU 加速色彩空间转换 — 模块化设计
  *
- * 在 Jetson 上使用 zero-copy 内存 (cudaHostAllocMapped),
- * 避免 CPU↔GPU 拷贝开销。
+ * 独显版: cudaMalloc (device) + cudaMemcpy H2D/D2H
  *
- * RGB8↔BGR8: 640x480 < 1ms (vs CPU 38ms)
+ * RGB8↔BGR8: 640x480 < 1ms
  */
 
 #include "semantic_vslam/cuda_colorspace.hpp"
@@ -20,9 +19,6 @@ namespace cuda {
 
 // ======================================================================
 // Kernel: RGB8 ↔ BGR8 通道交换 (R,G,B → B,G,R)
-//
-// 每个线程处理 1 个像素 (3 bytes)
-// 使用 coalesced memory access: 按行对齐
 // ======================================================================
 __global__ void kernelSwapRB(const uint8_t *__restrict__ src,
                               uint8_t *__restrict__ dst,
@@ -41,14 +37,10 @@ __global__ void kernelSwapRB(const uint8_t *__restrict__ src,
 
 // ======================================================================
 // Kernel: YUYV (YUV422) → BGR8
-//
-// YUYV: 每 4 bytes 编码 2 个像素 [Y0, U, Y1, V]
-// 每个线程处理 2 个像素
 // ======================================================================
 __global__ void kernelYUYVtoBGR(const uint8_t *__restrict__ src,
                                  uint8_t *__restrict__ dst,
                                  int width, int height) {
-  // 每个线程处理 2 个像素
   int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total_pairs = (width * height) / 2;
   if (pair_idx >= total_pairs) return;
@@ -59,42 +51,34 @@ __global__ void kernelYUYVtoBGR(const uint8_t *__restrict__ src,
   float y1 = static_cast<float>(src[src_offset + 2]);
   float v  = static_cast<float>(src[src_offset + 3]) - 128.0f;
 
-  // BT.601 YUV → RGB
-  int dst_offset0 = pair_idx * 6;  // 2 pixels * 3 channels
-  // Pixel 0
-  dst[dst_offset0 + 0] = static_cast<uint8_t>(fminf(fmaxf(y0 + 1.772f * u, 0.0f), 255.0f));           // B
-  dst[dst_offset0 + 1] = static_cast<uint8_t>(fminf(fmaxf(y0 - 0.344f * u - 0.714f * v, 0.0f), 255.0f)); // G
-  dst[dst_offset0 + 2] = static_cast<uint8_t>(fminf(fmaxf(y0 + 1.402f * v, 0.0f), 255.0f));           // R
-  // Pixel 1
-  dst[dst_offset0 + 3] = static_cast<uint8_t>(fminf(fmaxf(y1 + 1.772f * u, 0.0f), 255.0f));           // B
-  dst[dst_offset0 + 4] = static_cast<uint8_t>(fminf(fmaxf(y1 - 0.344f * u - 0.714f * v, 0.0f), 255.0f)); // G
-  dst[dst_offset0 + 5] = static_cast<uint8_t>(fminf(fmaxf(y1 + 1.402f * v, 0.0f), 255.0f));           // R
+  int dst_offset0 = pair_idx * 6;
+  dst[dst_offset0 + 0] = static_cast<uint8_t>(fminf(fmaxf(y0 + 1.772f * u, 0.0f), 255.0f));
+  dst[dst_offset0 + 1] = static_cast<uint8_t>(fminf(fmaxf(y0 - 0.344f * u - 0.714f * v, 0.0f), 255.0f));
+  dst[dst_offset0 + 2] = static_cast<uint8_t>(fminf(fmaxf(y0 + 1.402f * v, 0.0f), 255.0f));
+  dst[dst_offset0 + 3] = static_cast<uint8_t>(fminf(fmaxf(y1 + 1.772f * u, 0.0f), 255.0f));
+  dst[dst_offset0 + 4] = static_cast<uint8_t>(fminf(fmaxf(y1 - 0.344f * u - 0.714f * v, 0.0f), 255.0f));
+  dst[dst_offset0 + 5] = static_cast<uint8_t>(fminf(fmaxf(y1 + 1.402f * v, 0.0f), 255.0f));
 }
 
 // ======================================================================
-// 管理 zero-copy 内存的内部缓冲区
+// 独显: cudaMalloc (device) 缓冲区
 // ======================================================================
 static struct ColorspaceBuffers {
-  uint8_t *h_src = nullptr;    // host (zero-copy)
-  uint8_t *h_dst = nullptr;
-  uint8_t *d_src = nullptr;    // device pointer (mapped from host)
-  uint8_t *d_dst = nullptr;
+  uint8_t *d_src = nullptr;    // device input
+  uint8_t *d_dst = nullptr;    // device output
   size_t   alloc_size = 0;
 
   void ensure(size_t needed) {
     if (alloc_size >= needed) return;
     release();
-    cudaHostAlloc(&h_src, needed, cudaHostAllocMapped);
-    cudaHostAlloc(&h_dst, needed, cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&d_src, h_src, 0);
-    cudaHostGetDevicePointer(&d_dst, h_dst, 0);
+    cudaMalloc(&d_src, needed);
+    cudaMalloc(&d_dst, needed);
     alloc_size = needed;
   }
 
   void release() {
-    if (h_src) { cudaFreeHost(h_src); h_src = nullptr; }
-    if (h_dst) { cudaFreeHost(h_dst); h_dst = nullptr; }
-    d_src = d_dst = nullptr;
+    if (d_src) { cudaFree(d_src); d_src = nullptr; }
+    if (d_dst) { cudaFree(d_dst); d_dst = nullptr; }
     alloc_size = 0;
   }
 
@@ -110,11 +94,10 @@ void gpuSwapRB(const cv::Mat &src, cv::Mat &dst, void *stream) {
   int total_pixels = src.rows * src.cols;
   size_t byte_size = total_pixels * 3;
 
-  // 确保 zero-copy 缓冲区够大
   g_bufs.ensure(byte_size);
 
-  // 拷贝输入到 zero-copy 内存 (memcpy, 非 cudaMemcpy)
-  memcpy(g_bufs.h_src, src.data, byte_size);
+  // H2D: 拷贝输入到 device
+  cudaMemcpy(g_bufs.d_src, src.data, byte_size, cudaMemcpyHostToDevice);
 
   // 启动 kernel
   int threads = 256;
@@ -122,15 +105,14 @@ void gpuSwapRB(const cv::Mat &src, cv::Mat &dst, void *stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   kernelSwapRB<<<blocks, threads, 0, s>>>(g_bufs.d_src, g_bufs.d_dst, total_pixels);
 
-  // 同步 (zero-copy: 结果直接在 h_dst 中)
   if (s) cudaStreamSynchronize(s);
   else   cudaDeviceSynchronize();
 
-  // 输出
+  // D2H: 拷贝输出回 host
   if (dst.empty() || dst.rows != src.rows || dst.cols != src.cols || dst.type() != src.type()) {
     dst.create(src.rows, src.cols, src.type());
   }
-  memcpy(dst.data, g_bufs.h_dst, byte_size);
+  cudaMemcpy(dst.data, g_bufs.d_dst, byte_size, cudaMemcpyDeviceToHost);
 }
 
 // ======================================================================
@@ -144,7 +126,8 @@ void gpuYUYVtoBGR(const uint8_t *src, cv::Mat &dst,
   size_t bgr_size  = width * height * 3;
   g_bufs.ensure(std::max(yuyv_size, bgr_size));
 
-  memcpy(g_bufs.h_src, src, yuyv_size);
+  // H2D
+  cudaMemcpy(g_bufs.d_src, src, yuyv_size, cudaMemcpyHostToDevice);
 
   int total_pairs = (width * height) / 2;
   int threads = 256;
@@ -155,8 +138,9 @@ void gpuYUYVtoBGR(const uint8_t *src, cv::Mat &dst,
   if (s) cudaStreamSynchronize(s);
   else   cudaDeviceSynchronize();
 
+  // D2H
   dst.create(height, width, CV_8UC3);
-  memcpy(dst.data, g_bufs.h_dst, bgr_size);
+  cudaMemcpy(dst.data, g_bufs.d_dst, bgr_size, cudaMemcpyDeviceToHost);
 }
 
 } // namespace cuda

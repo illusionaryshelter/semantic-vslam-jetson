@@ -6,10 +6,10 @@
  * 架构: .cu (CUDA kernel, 无 PCL) + .cpp (PCL 封装)
  * 颜色策略: first-point (语义颜色不能平均)
  *
- * 内存策略 (Jetson UMA):
- *   - GPUPool 中间缓冲区: cudaMalloc (纯 device, GPU L2 cached)
- *   - I/O 缓冲区: cudaHostAllocMapped (pinned uncached = 真零拷贝)
- *   - 持久分配: 一次分配跨调用复用
+ * 内存策略 (独显 PCIe):
+ *   - 全部 cudaMalloc (device memory)
+ *   - FilterRaw 接收 host 指针, 内部做 H2D/D2H
+ *   - 持久 GPU 池: 一次分配跨调用复用
  */
 
 #pragma once
@@ -27,9 +27,11 @@ struct VoxelPoint {
 /**
  * CUDA 底层实现 (纯 C 接口, 在 .cu 中定义)
  *
- * @param input       输入点数组 (mapped 或 device 指针)
+ * 独显模式: 接收 host 指针, 内部做 cudaMemcpy H2D/D2H
+ *
+ * @param input       输入点数组 (host 指针)
  * @param num_points  输入点数
- * @param h_output    输出缓冲区 (mapped 或 device 指针)
+ * @param h_output    输出缓冲区 (host 指针, 由内部 D2H 填充)
  * @param max_output  输出缓冲区最大容量
  * @param voxel_size  体素尺寸 (m)
  * @return 输出点数
@@ -42,26 +44,6 @@ int cudaVoxelGridFilterRaw(
     float min_y = 0, float max_y = 0,
     float min_z = 0, float max_z = 0);
 
-/**
- * 真零拷贝内存分配 (cudaHostAllocMapped)
- *
- * Jetson UMA: pinned + uncached → CPU 写直达物理内存, GPU DMA 直读
- * 无 cache flush/invalidation 开销 (对比 cudaMallocManaged)
- *
- * @param max_points  最大点数
- * @param host_ptr    [out] CPU 端指针 (用于填充/读取)
- * @param dev_ptr     [out] GPU 端指针 (传给 CUDA kernel)
- * @return true=成功
- */
-bool cudaVoxelGridAllocZeroCopy(int max_points,
-                                VoxelPoint** host_ptr,
-                                VoxelPoint** dev_ptr);
-void cudaVoxelGridFreeZeroCopy(VoxelPoint* host_ptr);
-
-// ---- 兼容旧 API (deprecated, 保留用于单元测试) ----
-VoxelPoint* cudaVoxelGridAllocManaged(int max_points);
-void cudaVoxelGridFreeManaged(VoxelPoint* ptr);
-
 }  // namespace semantic_vslam
 
 // ---- PCL 高层封装 (仅在 C++ 编译器可见, NVCC 不编译) ----
@@ -72,9 +54,7 @@ void cudaVoxelGridFreeManaged(VoxelPoint* ptr);
 namespace semantic_vslam {
 
 /**
- * CUDA VoxelGrid 下采样 (PCL 接口)
- *
- * 内部使用 cudaHostAllocMapped 真零拷贝 + cudaMalloc 持久 GPU 池
+ * CUDA VoxelGrid 下采样 (PCL 接口, 单帧)
  */
 void cudaVoxelGridFilter(
     const pcl::PointCloud<pcl::PointXYZRGB>& input,
@@ -86,12 +66,6 @@ void cudaVoxelGridFilter(
  *
  * 维护持久化全局点云地图, 增量融合新帧:
  *   global_map (50K) + new_frame (5K) → cudaVoxelGrid → 50K
- *
- * 对比滑动窗口:
- *   - 滑动窗口: 150帧 merge(120ms) + voxel(200ms), 地图会消失
- *   - 增量式:   55K pts voxel(~25ms), 地图永久保留
- *
- * 颜色策略: first-point (已有体素的颜色不会被新帧覆盖)
  */
 class CudaIncrementalVoxelGrid {
 public:
