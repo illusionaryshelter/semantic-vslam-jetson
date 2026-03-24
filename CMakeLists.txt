@@ -18,7 +18,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED True)
-set(CMAKE_CUDA_ARCHITECTURES 87)  # Jetson Orin Nano = SM 8.7
+# discrete-gpu: 修改为目标 GPU 的 SM 版本, 例如 RTX 3060=86, RTX 4060=89
+# 当前设为 87 以在 Jetson 上验证编译; 迁移时用: set(CMAKE_CUDA_ARCHITECTURES 86)
+set(CMAKE_CUDA_ARCHITECTURES 87)
 
 # =============================================================================
 # Dependencies

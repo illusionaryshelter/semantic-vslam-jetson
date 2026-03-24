@@ -40,19 +40,19 @@ YoloInference::YoloInference(const std::string &engine_path)
 YoloInference::~YoloInference() {
   if (stream_)
     cudaStreamDestroy(stream_);
-  // 零拷贝: 只需释放 host 端 mapped 内存 (同时释放 GPU 映射)
-  if (mapped_input_)
-    cudaFreeHost(mapped_input_);
-  if (mapped_output0_)
-    cudaFreeHost(mapped_output0_);
-  if (mapped_output1_)
-    cudaFreeHost(mapped_output1_);
-  if (mapped_img_src_)
-    cudaFreeHost(mapped_img_src_);
-  if (mapped_mask_coeffs_)
-    cudaFreeHost(mapped_mask_coeffs_);
-  if (mapped_mask_out_)
-    cudaFreeHost(mapped_mask_out_);
+  // 独显: 分别释放 host (free) 和 device (cudaFree)
+  if (h_input_) free(h_input_);
+  if (d_input_) cudaFree(d_input_);
+  if (h_output0_) free(h_output0_);
+  if (d_output0_) cudaFree(d_output0_);
+  if (h_output1_) free(h_output1_);
+  if (d_output1_) cudaFree(d_output1_);
+  if (h_img_src_) free(h_img_src_);
+  if (d_img_src_) cudaFree(d_img_src_);
+  if (h_mask_coeffs_) free(h_mask_coeffs_);
+  if (d_mask_coeffs_) cudaFree(d_mask_coeffs_);
+  if (h_mask_out_) free(h_mask_out_);
+  if (d_mask_out_) cudaFree(d_mask_out_);
   delete context_;
   delete engine_;
   delete runtime_;
@@ -100,46 +100,32 @@ bool YoloInference::init() {
     const size_t out0_sz = 1 * kROWS * kANCHORS;        // 1×116×8400
     const size_t out1_sz = 1 * kNM * kMASK_H * kMASK_W; // 1×32×160×160
 
-    // ---- 零拷贝内存分配 ----
-    // cudaHostAllocMapped: CPU/GPU 共享同一物理内存页
-    // 在 Jetson 统一内存架构上完全消除 cudaMemcpy 开销
-    const unsigned int flags = cudaHostAllocMapped;
+    // ---- 独显: malloc (host) + cudaMalloc (device) ----
+    h_input_ = (float *)malloc(in_sz * sizeof(float));
+    h_output0_ = (float *)malloc(out0_sz * sizeof(float));
+    h_output1_ = (float *)malloc(out1_sz * sizeof(float));
+    if (!h_input_ || !h_output0_ || !h_output1_) return false;
 
-    if (cudaHostAlloc((void **)&mapped_input_, in_sz * sizeof(float), flags) !=
-        cudaSuccess)
+    if (cudaMalloc(&d_input_, in_sz * sizeof(float)) != cudaSuccess)
       return false;
-    if (cudaHostAlloc((void **)&mapped_output0_, out0_sz * sizeof(float),
-                      flags) != cudaSuccess)
+    if (cudaMalloc(&d_output0_, out0_sz * sizeof(float)) != cudaSuccess)
       return false;
-    if (cudaHostAlloc((void **)&mapped_output1_, out1_sz * sizeof(float),
-                      flags) != cudaSuccess)
-      return false;
-
-    // 获取 GPU 端地址 (指向同一物理页)
-    if (cudaHostGetDevicePointer(&dev_input_, mapped_input_, 0) != cudaSuccess)
-      return false;
-    if (cudaHostGetDevicePointer(&dev_output0_, mapped_output0_, 0) !=
-        cudaSuccess)
-      return false;
-    if (cudaHostGetDevicePointer(&dev_output1_, mapped_output1_, 0) !=
-        cudaSuccess)
+    if (cudaMalloc(&d_output1_, out1_sz * sizeof(float)) != cudaSuccess)
       return false;
 
     if (cudaStreamCreate(&stream_) != cudaSuccess)
       return false;
 
-    // 设置张量地址 (TRT 10 API) — 直接使用 GPU 映射地址
-    context_->setTensorAddress("images", dev_input_);
-    context_->setTensorAddress("output0", dev_output0_);
-    context_->setTensorAddress("output1", dev_output1_);
+    // 设置张量地址 (TRT 10 API) — 使用 device 指针
+    context_->setTensorAddress("images", d_input_);
+    context_->setTensorAddress("output0", d_output0_);
+    context_->setTensorAddress("output1", d_output1_);
 
     // ---- GPU 预处理: 预分配默认图像缓冲区 (640×480×3) ----
     const size_t default_img_sz = 640 * 480 * 3;
-    if (cudaHostAlloc((void **)&mapped_img_src_, default_img_sz,
-                      cudaHostAllocMapped) != cudaSuccess)
-      return false;
-    if (cudaHostGetDevicePointer(&dev_img_src_, mapped_img_src_, 0) !=
-        cudaSuccess)
+    h_img_src_ = (uint8_t *)malloc(default_img_sz);
+    if (!h_img_src_) return false;
+    if (cudaMalloc(&d_img_src_, default_img_sz) != cudaSuccess)
       return false;
     img_buf_size_ = default_img_sz;
 
@@ -147,17 +133,12 @@ bool YoloInference::init() {
     const int default_mask_cap = 32;
     const size_t coeff_sz = default_mask_cap * kNM * sizeof(float);
     const size_t mask_sz = default_mask_cap * kMASK_H * kMASK_W * sizeof(float);
-    if (cudaHostAlloc((void **)&mapped_mask_coeffs_, coeff_sz,
-                      cudaHostAllocMapped) != cudaSuccess)
+    h_mask_coeffs_ = (float *)malloc(coeff_sz);
+    h_mask_out_ = (float *)malloc(mask_sz);
+    if (!h_mask_coeffs_ || !h_mask_out_) return false;
+    if (cudaMalloc(&d_mask_coeffs_, coeff_sz) != cudaSuccess)
       return false;
-    if (cudaHostGetDevicePointer(&dev_mask_coeffs_, mapped_mask_coeffs_, 0) !=
-        cudaSuccess)
-      return false;
-    if (cudaHostAlloc((void **)&mapped_mask_out_, mask_sz,
-                      cudaHostAllocMapped) != cudaSuccess)
-      return false;
-    if (cudaHostGetDevicePointer(&dev_mask_out_, mapped_mask_out_, 0) !=
-        cudaSuccess)
+    if (cudaMalloc(&d_mask_out_, mask_sz) != cudaSuccess)
       return false;
     mask_buf_capacity_ = default_mask_cap;
 
@@ -238,36 +219,36 @@ bool YoloInference::infer(const cv::Mat &img, std::vector<Object> &objects,
     if (img.empty())
       throw std::invalid_argument("Input image is empty");
 
-    // 1. GPU 预处理: 将原始 BGR 图像写入零拷贝缓冲区, GPU kernel 完成剩余操作
+    // 1. GPU 预处理: 拷贝原始图像到 device, GPU kernel 完成剩余操作
     const size_t img_bytes = (size_t)img.cols * img.rows * img.channels();
 
-    // 动态扩展缓冲区 (首次或图像尺寸变大时)
+    // 动态扩展缓冲区
     if (img_bytes > img_buf_size_) {
-      if (mapped_img_src_)
-        cudaFreeHost(mapped_img_src_);
-      if (cudaHostAlloc((void **)&mapped_img_src_, img_bytes,
-                        cudaHostAllocMapped) != cudaSuccess)
-        return false;
-      if (cudaHostGetDevicePointer(&dev_img_src_, mapped_img_src_, 0) !=
-          cudaSuccess)
+      if (h_img_src_) free(h_img_src_);
+      if (d_img_src_) cudaFree(d_img_src_);
+      h_img_src_ = (uint8_t *)malloc(img_bytes);
+      if (!h_img_src_) return false;
+      if (cudaMalloc(&d_img_src_, img_bytes) != cudaSuccess)
         return false;
       img_buf_size_ = img_bytes;
     }
 
-    // 拷贝原始图像到零拷贝缓冲 (CPU memcpy, ~0.5ms for 640x480x3)
-    // 确保连续内存
+    // 拷贝原始图像到 host 缓冲
     if (img.isContinuous()) {
-      std::memcpy(mapped_img_src_, img.data, img_bytes);
+      std::memcpy(h_img_src_, img.data, img_bytes);
     } else {
       cv::Mat cont = img.clone();
-      std::memcpy(mapped_img_src_, cont.data, img_bytes);
+      std::memcpy(h_img_src_, cont.data, img_bytes);
     }
 
-    // GPU kernel: resize + BGR2RGB + normalize + HWC2CHW →
-    // mapped_input_/dev_input_
+    // H2D: 拷贝图像到 device
+    cudaMemcpyAsync(d_img_src_, h_img_src_, img_bytes,
+                    cudaMemcpyHostToDevice, stream_);
+
+    // GPU kernel: resize + BGR2RGB + normalize + HWC2CHW → d_input_
     float scale;
     int pad_x, pad_y;
-    cudaPreprocess((const uint8_t *)dev_img_src_, (float *)dev_input_, img.cols,
+    cudaPreprocess((const uint8_t *)d_img_src_, (float *)d_input_, img.cols,
                    img.rows, kINPUT_W, kINPUT_H, scale, pad_x, pad_y, stream_,
                    is_rgb);
 
@@ -277,8 +258,15 @@ bool YoloInference::infer(const cv::Mat &img, std::vector<Object> &objects,
       return false;
     }
 
-    // 4. 同步等待推理完成 — 零拷贝: 无需 cudaMemcpy D2H
+    // 同步 + D2H: 拷贝 TRT 输出回 host
     cudaStreamSynchronize(stream_);
+
+    const size_t out0_sz = 1 * kROWS * kANCHORS;
+    const size_t out1_sz = 1 * kNM * kMASK_H * kMASK_W;
+    cudaMemcpy(h_output0_, d_output0_, out0_sz * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_output1_, d_output1_, out1_sz * sizeof(float),
+               cudaMemcpyDeviceToHost);
 
     // 5. 解析 output0: shape [116, 8400], 行主序
     //    行 0~3   : cx, cy, w, h  (in 640x640 空间)
@@ -286,8 +274,8 @@ bool YoloInference::infer(const cv::Mat &img, std::vector<Object> &objects,
     //    行 84~115: 32 掩码系数
     const int orig_w = img.cols;
     const int orig_h = img.rows;
-    const float *det = mapped_output0_;   // 零拷贝: 直接读 CPU 端地址
-    const float *proto = mapped_output1_; // 零拷贝: 直接读 CPU 端地址
+    const float *det = h_output0_;    // host: D2H 后直接读
+    const float *proto = h_output1_;  // host: D2H 后直接读
 
     std::vector<cv::Rect> bboxes;
     std::vector<float> scores;
@@ -364,22 +352,21 @@ bool YoloInference::infer(const cv::Mat &img, std::vector<Object> &objects,
     if (N > 0) {
       // 动态扩展缓冲区
       if (N > mask_buf_capacity_) {
-        if (mapped_mask_coeffs_)
-          cudaFreeHost(mapped_mask_coeffs_);
-        if (mapped_mask_out_)
-          cudaFreeHost(mapped_mask_out_);
+        if (h_mask_coeffs_) free(h_mask_coeffs_);
+        if (d_mask_coeffs_) cudaFree(d_mask_coeffs_);
+        if (h_mask_out_) free(h_mask_out_);
+        if (d_mask_out_) cudaFree(d_mask_out_);
         const size_t coeff_sz = N * kNM * sizeof(float);
         const size_t mask_sz = N * kMASK_H * kMASK_W * sizeof(float);
-        cudaHostAlloc((void **)&mapped_mask_coeffs_, coeff_sz,
-                      cudaHostAllocMapped);
-        cudaHostGetDevicePointer(&dev_mask_coeffs_, mapped_mask_coeffs_, 0);
-        cudaHostAlloc((void **)&mapped_mask_out_, mask_sz, cudaHostAllocMapped);
-        cudaHostGetDevicePointer(&dev_mask_out_, mapped_mask_out_, 0);
+        h_mask_coeffs_ = (float *)malloc(coeff_sz);
+        cudaMalloc(&d_mask_coeffs_, coeff_sz);
+        h_mask_out_ = (float *)malloc(mask_sz);
+        cudaMalloc(&d_mask_out_, mask_sz);
         mask_buf_capacity_ = N;
       }
 
-      // 收集 NMS 后的系数到零拷贝缓冲
-      std::vector<int> valid_nms; // NMS indices that passed validation
+      // 收集 NMS 后的系数到 host 缓冲
+      std::vector<int> valid_nms;
       for (int idx : nms_indices) {
         if (idx < 0 || idx >= static_cast<int>(bboxes.size()))
           continue;
@@ -390,16 +377,25 @@ bool YoloInference::infer(const cv::Mat &img, std::vector<Object> &objects,
       const int Nv = static_cast<int>(valid_nms.size());
 
       for (int i = 0; i < Nv; ++i) {
-        std::memcpy(mapped_mask_coeffs_ + i * kNM,
+        std::memcpy(h_mask_coeffs_ + i * kNM,
                     mask_coeffs[valid_nms[i]].data(), kNM * sizeof(float));
       }
 
+      // H2D: 拷贝系数到 device
+      cudaMemcpy(d_mask_coeffs_, h_mask_coeffs_, Nv * kNM * sizeof(float),
+                 cudaMemcpyHostToDevice);
+
       // GPU kernel: 批量 dot product + sigmoid
       cudaDecodeMasks(
-          (const float *)dev_output1_, // proto [32, 160, 160] — 留在 GPU
-          (const float *)dev_mask_coeffs_, (float *)dev_mask_out_, Nv, kMASK_W,
+          (const float *)d_output1_, // proto [32, 160, 160] — 在 device
+          (const float *)d_mask_coeffs_, (float *)d_mask_out_, Nv, kMASK_W,
           kMASK_H, kNM, stream_);
       cudaStreamSynchronize(stream_);
+
+      // D2H: 拷贝掩码输出回 host
+      cudaMemcpy(h_mask_out_, d_mask_out_,
+                 Nv * kMASK_H * kMASK_W * sizeof(float),
+                 cudaMemcpyDeviceToHost);
 
       // CPU: 从全分辨率 160×160 裁剪 ROI 并 resize 到 bbox 大小
       const float inv4 = 0.25f;
@@ -410,9 +406,9 @@ bool YoloInference::infer(const cv::Mat &img, std::vector<Object> &objects,
         obj.label = class_ids[valid_nms[i]];
         obj.prob = scores[valid_nms[i]];
 
-        // 从 mapped_mask_out_ 构建 160×160 cv::Mat
+        // 从 h_mask_out_ 构建 160×160 cv::Mat
         cv::Mat full_mask(kMASK_H, kMASK_W, CV_32FC1,
-                          mapped_mask_out_ + i * kMASK_H * kMASK_W);
+                          h_mask_out_ + i * kMASK_H * kMASK_W);
 
         // 计算 ROI 在 proto 坐标系中的位置
         int rx0 = static_cast<int>((r.x * scale + pad_x) * inv4);
